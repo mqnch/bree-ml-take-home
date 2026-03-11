@@ -1,6 +1,16 @@
+"""
+Head-to-head evaluation: Rule-Based Baseline vs. Survival Model.
+=================================================================
+Loads the pre-trained Cox survival model from train_survival.py and
+evaluates its predictive performance against the rule-based baseline
+on a held-out 20% stratified test set.
+
+All metrics (Precision, Recall, F1, AUC-ROC, FPR, FNR) are computed
+on the same canonical test split used by all pipeline scripts.
+"""
+
 import numpy as np
-from xgboost import XGBClassifier
-from sklearn.model_selection import train_test_split
+import xgboost as xgb
 from sklearn.metrics import (
     precision_score,
     recall_score,
@@ -8,61 +18,55 @@ from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix,
 )
-from preprocess import prepare_data
+from preprocess import get_canonical_split
 
 # ------------------------------------------------------------------
-# Step 1: Data Prep (Shared preprocessing — see preprocess.py)
+# Step 1: Data Prep (Canonical split — see preprocess.py)
 # ------------------------------------------------------------------
-df, X, y = prepare_data()
+df, X_train, X_test, y_train, y_test = get_canonical_split()
 
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, stratify=y, random_state=42
-)
-
-# Keep test-set indices for baseline comparison
+# Filter test set to non-ongoing rows for binary evaluation
+non_ongoing_mask = df.loc[X_test.index, "actual_outcome"] != "ongoing"
+X_test = X_test[non_ongoing_mask]
+y_test = y_test[non_ongoing_mask]
 test_indices = X_test.index
 
 # ------------------------------------------------------------------
-# Step 3: ML Model — Train on train set only
+# Step 2: Load Pre-Trained Survival Model
 # ------------------------------------------------------------------
-# Calculate scale_pos_weight to handle the ~14% default class imbalance
-pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+# Load the Cox survival model trained in train_survival.py.
+# The model predicts log hazard ratios: higher values = higher default risk.
+model = xgb.XGBRegressor()
+model.load_model("xgboost_survival_model.json")
 
-model = XGBClassifier(
-    n_estimators=200,
-    max_depth=4,
-    learning_rate=0.1,
-    random_state=42,
-    eval_metric="logloss",
-    scale_pos_weight=pos_weight,
-)
-model.fit(X_train, y_train)
-
-# Predicted probability of default on the TEST set only
-pred_default_prob_test = model.predict_proba(X_test)[:, 1]
+# Predicted hazard ratios on the TEST set only
+hazard_ratios_test = model.predict(X_test)
 
 # ------------------------------------------------------------------
-# Step 4: Thresholding — Match baseline approval rate on TEST set
+# Step 3: Thresholding — Match baseline approval rate on TEST set
 # ------------------------------------------------------------------
 # Baseline approval rate (computed ONLY on the test set to prevent data leakage)
 baseline_approval_test = (df.loc[test_indices, "rule_based_decision"] == "approved").mean()
 
-# Threshold: the quantile of predicted probabilities that gives the same approval rate
-threshold = np.quantile(pred_default_prob_test, baseline_approval_test)
+# Threshold: approve the lowest `baseline_approval_test` fraction of hazard
+# ratios (lower hazard = safer applicant).
+threshold = np.quantile(hazard_ratios_test, baseline_approval_test)
 
 # Target = 1 (Defaulted), Predicted Positive = Denied
 y_true_test = y_test
 y_pred_baseline_test = (df.loc[test_indices, "rule_based_decision"] != "approved").astype(int)
 
 # Baseline AUC uses continuous rule_based_score (inverted: higher score = safer,
-# so default probability = 1 - score/100)
+# so default probability ≈ 1 - score/100)
 y_prob_baseline_test = 1.0 - df.loc[test_indices, "rule_based_score"] / 100.0
 
-y_pred_ml_test = (pred_default_prob_test > threshold).astype(int)
-y_prob_ml_test = pred_default_prob_test
+# ML predictions: deny if hazard ratio exceeds threshold
+y_pred_ml_test = (hazard_ratios_test > threshold).astype(int)
+# Use raw hazard ratios as the continuous risk score for AUC
+y_prob_ml_test = hazard_ratios_test
 
 # ------------------------------------------------------------------
-# Step 5: Metric Calculation (on TEST set only)
+# Step 4: Metric Calculation (on TEST set only)
 # ------------------------------------------------------------------
 def calculate_metrics(y_true, y_pred, y_prob):
     cm = confusion_matrix(y_true, y_pred)
@@ -93,7 +97,7 @@ base_metrics = calculate_metrics(y_true_test, y_pred_baseline_test, y_prob_basel
 ml_metrics = calculate_metrics(y_true_test, y_pred_ml_test, y_prob_ml_test)
 
 # ------------------------------------------------------------------
-# Step 6: Confusion Matrices Outputs
+# Step 5: Confusion Matrices
 # ------------------------------------------------------------------
 def print_confusion_matrix(cm, title):
     print(f"--- {title} ---")
@@ -106,7 +110,7 @@ print_confusion_matrix(base_metrics["cm"], "Baseline Confusion Matrix")
 print_confusion_matrix(ml_metrics["cm"], "ML Model Confusion Matrix")
 
 # ------------------------------------------------------------------
-# Step 7: Summary Table
+# Step 6: Summary Table
 # ------------------------------------------------------------------
 print("## Summary Table: Baseline vs. ML Model\n")
 print("| Metric | Baseline | ML Model |")
@@ -120,7 +124,7 @@ print(f"| **FNR** (Defaults slipped via) | {base_metrics['fnr']:.4f} | {ml_metri
 print()
 
 # ------------------------------------------------------------------
-# Step 8: Analysis Output
+# Step 7: Analysis Output
 # ------------------------------------------------------------------
 net_defaults_caught = ml_metrics["tp"] - base_metrics["tp"]
 print("## Analysis")
@@ -156,5 +160,57 @@ else:
 
 print(
     f"\nNote: All metrics are evaluated on a held-out 20% test set "
-    f"({len(X_test)} samples) to prevent data leakage."
+    f"({len(X_test)} samples) from a canonical split shared across all pipeline scripts."
 )
+
+# ------------------------------------------------------------------
+# Step 8: 5-Fold Cross-Validated AUC (robustness check)
+# ------------------------------------------------------------------
+from sklearn.model_selection import StratifiedKFold
+from preprocess import prepare_data, add_survival_columns, FEATURE_COLS
+
+print("\n## 5-Fold Cross-Validated AUC-ROC\n")
+
+df_cv, X_cv, y_cv = prepare_data(keep_ongoing=True)
+df_cv = add_survival_columns(df_cv)
+
+# Only evaluate on non-ongoing rows, but train on all (survival can use ongoing)
+non_ongoing = df_cv["actual_outcome"] != "ongoing"
+
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+ml_aucs, base_aucs = [], []
+
+for fold, (train_idx, test_idx) in enumerate(skf.split(X_cv, y_cv), 1):
+    X_tr, X_te = X_cv.iloc[train_idx], X_cv.iloc[test_idx]
+    dur_tr = df_cv.iloc[train_idx]["duration"].values
+    evt_tr = df_cv.iloc[train_idx]["event"].values
+
+    # Train a fresh Cox model on this fold
+    y_surv = np.where(evt_tr == 1, dur_tr, -dur_tr)
+    fold_model = xgb.XGBRegressor(
+        objective='survival:cox', tree_method='hist',
+        learning_rate=0.05, max_depth=5, subsample=0.8,
+        colsample_bytree=0.8, n_estimators=150, random_state=42
+    )
+    fold_model.fit(X_tr, y_surv)
+
+    # Evaluate only on non-ongoing test rows
+    te_mask = non_ongoing.iloc[test_idx]
+    X_te_eval = X_te[te_mask]
+    y_te_eval = y_cv.iloc[test_idx][te_mask]
+
+    if len(y_te_eval.unique()) < 2:
+        continue  # skip folds without both classes
+
+    hazard = fold_model.predict(X_te_eval)
+    ml_aucs.append(roc_auc_score(y_te_eval, hazard))
+
+    base_prob = 1.0 - df_cv.iloc[test_idx].loc[te_mask.values, "rule_based_score"] / 100.0
+    base_aucs.append(roc_auc_score(y_te_eval, base_prob))
+
+print(f"| Model    | Mean AUC | Std   |")
+print(f"| :------- | :------- | :---- |")
+print(f"| Baseline | {np.mean(base_aucs):.4f}   | {np.std(base_aucs):.4f} |")
+print(f"| ML Model | {np.mean(ml_aucs):.4f}   | {np.std(ml_aucs):.4f} |")
+print(f"\n(5-fold stratified CV, each fold trains a fresh Cox model)")
+
