@@ -27,7 +27,7 @@ The survival model answers *"when will they default?"* while the classifier answ
 
 ### 3. Missingness & Misrepresentation Strategy
 
-The 15% of applicants missing documented income are **not imputed**. Instead, missingness is treated as a behavioral signal via a binary `missing_docs_flag` feature — EDA confirms that applicants who fail to submit documentation default at substantially higher rates. Similarly, the 5% who misrepresent their income are **kept in the dataset** — the `income_discrepancy_ratio` feature (stated / documented income) naturally captures their risk signal, and the model should learn to catch them rather than having them artificially removed.
+The 15% of applicants missing documented income are **not imputed**. Instead, missingness is treated as a behavioral signal via a binary `missing_docs_flag` feature — EDA confirms that applicants who fail to submit documentation default at substantially higher rates. For the `income_discrepancy_ratio` feature, missing-doc applicants retain `NaN`, allowing XGBoost's native sparsity-aware split finding to learn the optimal routing at every tree node. Additionally, honest-range ratios (0.85–1.10) are clamped to 1.0 — the small variation within this range carries no real signal, and without clamping XGBoost draws spurious splits that penalize honest edge-case applicants. Only ratios *outside* this range (the 5% of misrepresenters with ratios >>1.10) retain their discriminative value.
 
 ### 4. Class Imbalance
 
@@ -39,22 +39,22 @@ The ML model organically corrects the baseline's arbitrary bias against self-emp
 
 | Employment Status | n | Baseline Approval | ML Approval | True Default Rate | Baseline FPR | ML FPR | Baseline FNR | ML FNR |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Employed | 215 | 56.28% | 51.16% | 26.51% | 36.08% | 43.04% | 35.09% | 35.09% |
-| Self Employed | 112 | 34.82% | 39.29% | 25.89% | 57.83% | 54.22% | 13.79% | 20.69% |
-| Unemployed | 41 | 0.00% | 14.63% | 56.10% | 0.00% | 16.67% | 0.00% | 4.35% |
+| Employed | 215 | 56.28% | 50.70% | 26.51% | 36.08% | 43.67% | 35.09% | 35.09% |
+| Self Employed | 112 | 34.82% | 40.18% | 25.89% | 57.83% | 53.01% | 13.79% | 20.69% |
+| Unemployed | 41 | 0.00% | 14.63% | 56.10% | 100.00% | 77.78% | 0.00% | 8.70% |
 
 ## Evaluation against the Baseline
 
-All metrics are evaluated on a held-out 20% stratified test set (368 samples) to prevent data leakage. When threshold-matched to the same overall approval volume as the baseline, the ML model achieves comparable AUC-ROC (0.6985 vs 0.7218) and slightly higher FPR (slightly more good applicants wrongly denied), though with lower Recall on this small test set. The comparable AUC-ROC indicates the model has learned meaningful risk patterns, but the limited training data (1,468 samples) constrains its ability to outperform a hand-tuned rule system that was designed with domain knowledge.
+All metrics are evaluated on a held-out 20% stratified test set (368 samples) to prevent data leakage. When threshold-matched to the same overall approval volume as the baseline, the ML model achieves comparable AUC-ROC (0.7014 vs 0.7218) and slightly higher FPR (slightly more good applicants wrongly denied), though with lower Recall on this small test set. The comparable AUC-ROC indicates the model has learned meaningful risk patterns, but the limited training data (1,468 samples) constrains its ability to outperform a hand-tuned rule system that was designed with domain knowledge.
 
 | Metric                         | Baseline | ML Model |
 | :----------------------------- | :------- | :------- |
-| **Precision**                  | 0.4087   | 0.3942   |
-| **Recall**                     | 0.7798   | 0.7523   |
-| **F1-Score**                   | 0.5363   | 0.5174   |
-| **AUC-ROC**                    | 0.7218   | 0.6985   |
-| **FPR** (Good wrongly denied)  | 0.4749   | 0.4865   |
-| **FNR** (Defaults slipped via) | 0.2202   | 0.2477   |
+| **Precision**                  | 0.4087   | 0.3894   |
+| **Recall**                     | 0.7798   | 0.7431   |
+| **F1-Score**                   | 0.5363   | 0.5110   |
+| **AUC-ROC**                    | 0.7218   | 0.7014   |
+| **FPR** (Good wrongly denied)  | 0.4749   | 0.4903   |
+| **FNR** (Defaults slipped via) | 0.2202   | 0.2569   |
 
 ### Business Tradeoff
 
@@ -76,8 +76,8 @@ Actual Def (1)  | 24               | 85
 
 ```text
                 Predicted Good (0) | Predicted Default (1)
-Actual Good (0) | 133              | 126
-Actual Def (1)  | 27               | 82
+Actual Good (0) | 132              | 127
+Actual Def (1)  | 28               | 81
 ```
 
 ## Project Structure
