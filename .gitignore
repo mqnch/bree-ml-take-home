@@ -1,8 +1,5 @@
 gen.py
-vision.md
-steps.md
-rules.md
-documentation.md
+.notes/
 __pycache__/
 venv/
 .env
