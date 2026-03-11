@@ -8,6 +8,8 @@ def main():
     
     # ---------------------------------------------------------
     # Part 1: Baseline Evaluation
+    # Note: Part 1 (baseline metrics) runs on the full non-ongoing dataset as an
+    # initial sanity check. See evaluate_model.py for held-out test set evaluation.
     # ---------------------------------------------------------
     print("--- Part 1: Baseline Evaluation ---")
     
@@ -66,8 +68,10 @@ def main():
         if row['actual_outcome'] == 'defaulted':
             return row['days_to_default']
         elif row['actual_outcome'] == 'repaid':
+            # 180 days = standard loan term; repaid loans survived the full window
             return 180
         elif row['actual_outcome'] == 'ongoing':
+            # Ongoing: random observation window to simulate staggered origination dates
             return np.random.randint(30, 181) # random int between 30 and 180 (inclusive)
         return np.nan
         
@@ -76,8 +80,12 @@ def main():
     # Missing docs flag
     df['missing_docs_flag'] = df['documented_monthly_income'].isnull().astype(int)
     
-    # Income discrepancy ratio
-    df['income_discrepancy_ratio'] = (df['stated_monthly_income'] / df['documented_monthly_income']).fillna(1.0)
+    # Income discrepancy ratio — keep NaN for missing docs; XGBoost's
+    # sparsity-aware splits handle missingness natively (consistent with preprocess.py)
+    df['income_discrepancy_ratio'] = (df['stated_monthly_income'] / df['documented_monthly_income']).replace([np.inf, -np.inf], np.nan)
+    # Clamp honest-range ratios to 1.0 to prevent overfitting to noise
+    honest_mask = df['income_discrepancy_ratio'].between(0.85, 1.10, inclusive='both')
+    df.loc[honest_mask, 'income_discrepancy_ratio'] = 1.0
     
     # DTI ratio
     # Avoid division by zero by replacing 0s with a small number or np.nan or just let pandas handle it (yields inf)
